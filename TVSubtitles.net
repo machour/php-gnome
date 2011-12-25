@@ -1,0 +1,190 @@
+#!/usr/bin/php
+<?php
+/**
+ * TV Subtitles class
+ */
+
+/**
+ * Nautilus base class for this script
+ */
+require_once 'NautilusScript.php';
+/**
+ * Use Zenity to display messages
+ */
+require_once 'Zenity.php';
+
+
+class TVSubtitles extends NautilusScript {
+
+    private $_zenity;
+
+    private $_shows;
+    private $_languages = array('en', 'fr');
+
+    private $_context = null;
+
+    private $_headers = array(
+        'User-Agent' => 'Mozilla/5.0 (X11; U; Linux i686; en-US; rv:1.9.2.3) Gecko/20100423 Ubuntu/10.04 (lucid) Firefox/3.6.3',
+        'Accept' => 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        'Accept-Language' => 'en-us,en;q=0.5',
+        'Accept-Encoding' => 'gzip,deflate',
+        'Accept-Charset' => 'ISO-8859-1,utf-8;q=0.7,*;q=0.7',
+        'Connection' => 'Close',
+        'Cookie' => 'visited=1; visited1=1',
+    );
+
+    private $_aliases = array(
+        'v.2009' => 'v',
+        'house' => 'house.m.d.',
+        'greys.anatomy' => 'grey\'s.anatomy',
+    );
+
+    const BASE_URL = 'http://www.tvsubtitles.net/';
+    const SHOWS_PAGE = 'http://www.tvsubtitles.net/tvshows.html';
+
+    function __construct() {
+        parent::__construct();
+        $this->_zenity = new Zenity();
+        $this->_zenity->SetGeneralOption('title', 'TV Subtitles');
+        // Create a stream
+        $opts = array(
+             'http' => array(
+                 'method' => 'GET',
+                 'header' => '',
+             )
+        );
+        foreach ($this->_headers as $k => $v) {
+            $opts['http']['header'] .= "$k: $v\r\n";
+        }
+        $this->_context = stream_context_create($opts);
+    }
+
+    function getPage($url) {
+        $buff = str_replace("\n", '', file_get_contents($url, false, $this->_context));
+        return $buff;
+    }
+
+    function getZipFile($url, $subFile) {
+        $subFile = str_replace('file://', '', $subFile);
+        $cmd = "wget -O - \"" . $url . "\" |zcat > " . $subFile;
+        echo $cmd;
+        exec($cmd);
+    }
+
+    function getShowsDefinition() {
+        if (is_null($this->_shows)) {
+            $html = $this->getPage(self::SHOWS_PAGE);
+            if (preg_match_all('!<a href="(tvshow-\d*-)\d*.html"><b>(.*)</b></a>!U', $html, $matches)) {
+                foreach ($matches[1] as $idx => $showUrl) {
+                    $showName = $matches[2][$idx];
+                    $this->_shows[$this->normalize($showName)] = self::BASE_URL . $showUrl . '%d.html';
+                }
+            }
+        }
+        return $this->_shows;
+    }
+
+    function normalize($str) {
+         return str_replace(' ', '.', strtolower($str));
+    }
+
+    function showUrl($show) {
+         $shows = $this->getShowsDefinition();
+         return $shows[$show];
+    }
+
+    function showExists($show) {
+         $shows = $this->getShowsDefinition();
+         return isset($shows[$show]);
+    }
+
+    function getSeasonPage($show, $season) {
+         $html = $this->getPage(sprintf($this->showUrl($show), $season));
+         return $html;
+    }
+
+    function downloadSubs() {
+        if ($this->haveSelectedFiles()) {
+            foreach ($this->getSelectedFiles() as $file) {
+                $filename = basename($file);
+                $infos = $this->parseShowInfo($filename);
+                if (!$infos) {
+                    $this->_zenity->warning('Unable to parse show information: ' . $filename);
+                    continue;
+                }
+                if ($this->showExists($infos['show'])) {
+                    $html = $this->getSeasonPage($infos['show'], $infos['season']);
+                    preg_match(sprintf('!<tr.*><td>%dx%s</td>.*<a href="(episode-\d*.html)"><b>(.*)</b>!U', $infos['season'], $infos['episode']), $html, $matches);
+                    $episode_url = self::BASE_URL . $matches[1];
+                    $episode_name = $matches[2];
+                    $html = $this->getPage($episode_url);
+                    $reg = '@<a href="/subtitle-(.*).html">.*' .
+                    '<span style="color:red">(\d*)</span>/<span style="color:green">(\d*)</span>.*'.
+                    '<img src="images/flags/(.*).gif".*' .
+                    '<img src="images/downloads.png".*(\d*)</p>.*@U';
+                    preg_match_all($reg, $html, $matches);
+                    $names = array('Lang', 'Votes', 'Downloads', '#');
+                    $values = array();
+                    var_dump($matches);
+                    $ids = array();
+                    foreach ($matches[1] as $idx => $idSub) {
+                        if (in_array($matches[4][$idx], $this->_languages)) {
+                            $values[] = array($matches[4][$idx], $matches[2][$idx] - $matches[3][$idx] > 0 ? 'good' : 'bad', $matches[5][$idx], $idSub);
+                            $ids[] = $idSub;
+                        }
+                    }
+                    var_dump($ids);
+                    $id = $this->_zenity->selectList('Select a sub version for ' . $filename, $names, $values);
+                    var_dump($id);
+                    if ($this->_zenity->wasSuccessful()) {
+                        $zip = $this->getZipFile(self::BASE_URL . 'download-' . $ids[$id] . '.html', $file . '.srt');
+                    }
+                } else {
+                    $this->_zenity->warning('Unknown show: ' . $infos['show']);
+                }
+            }
+        } else {
+            $this->fatal('You must run this script for one or more files');
+        }
+    }
+
+    function fatal($msg) {
+        $this->_zenity->error($msg);
+        die(1);
+    }
+
+    function parseShowInfo($filename) {
+        $filename = $this->normalize($filename);
+        $retval = array(
+            'show' => false,
+            'season' => false,
+            'episode' => false,
+            'release' => false,
+            'ext' => false,
+        );
+
+        if (preg_match('!^(.*)\.s(\d\d?)e(\d\d?)\.(.*)\.(avi|mkv)$!', $filename, $matches)) {
+            // exemple: the.vampire.diaries.s02e01.hdtv.xvid-fqm.avi
+            $retval['show'] = $matches[1];
+            $retval['season'] = $matches[2];
+            $retval['episode'] = $matches[3];
+            $retval['release'] = $matches[4];
+            $retval['ext'] = $matches[5];
+        } elseif (preg_match('!^(.*)\.(\d)(\d\d)\.(.*)\.(avi|mkv)$!', $filename, $matches)) {
+            // exemple: the.vampire.diaries.201.hdtv.xvid-fqm.avi
+            $retval['show'] = $matches[1];
+            $retval['season'] = $matches[2];
+            $retval['episode'] = $matches[3];
+            $retval['release'] = $matches[4];
+            $retval['ext'] = $matches[5];
+        }
+        if (isset($this->_aliases[$retval['show']])) {
+            $retval['show'] = $this->_aliases[$retval['show']];
+        }
+        $retval['show'] = $this->normalize($retval['show']);
+        return $retval['show'] && $retval['season'] && $retval['episode'] ? $retval : false;
+    }
+}
+
+$tvs = new TVSubtitles();
+$tvs->downloadSubs();
